@@ -173,7 +173,12 @@ fi
 # Redis
 if [ $INSTALL_REDIS -eq 1 ]; then
     install_package redis-server
-    start_service redis
+    sudo systemctl enable redis-server
+    sudo systemctl restart redis-server
+    if ! is_service_running redis-server; then
+        log_error "Redis failed to start."
+        exit 1
+    fi
 else
     log "Skipping Redis installation."
 fi
@@ -190,7 +195,7 @@ fi
 # Firewall
 log "Configuring UFW firewall..."
 install_package ufw
-sudo ufw allow OpenSSH
+sudo ufw allow 22/tcp  # Open SSH port explicitly
 sudo ufw allow 'Nginx Full'
 sudo ufw --force enable
 
@@ -200,7 +205,7 @@ services=()
 [ $INSTALL_NGINX -eq 1 ] && services+=("nginx")
 [ $INSTALL_PHP -eq 1 ] && services+=("php$PHP_VERSION-fpm")
 [ $INSTALL_MYSQL -eq 1 ] && services+=("mysql")
-[ $INSTALL_REDIS -eq 1 ] && services+=("redis")
+[ $INSTALL_REDIS -eq 1 ] && services+=("redis-server")
 
 for service in "${services[@]}"; do
     if is_service_running "$service"; then
