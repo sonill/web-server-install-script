@@ -18,16 +18,17 @@ ENABLE_TLS=0  # Set to 1 if you have a domain ready for Let's Encrypt
 
 # Defaults
 PHP_VERSION="8.4"
-MYSQL_ROOT_PASSWORD=""
+MYSQL_ROOT_PASSWORD="password"
 DOMAIN_NAME="yourdomain.com"  # Only needed if ENABLE_TLS=1
-MYSQL_PASSWORD_POLICY="MEDIUM"  # LOW|MEDIUM|STRONG
+MYSQL_PASSWORD_POLICY="LOW"  # LOW|MEDIUM|STRONG
 LOG_FILE="/var/log/webserver_install.log"
 CREDENTIALS_FILE="/root/webserver_credentials.txt"
-BACKUP_DIR="/root/webserver_backup_$(date +%Y%m%d)"
 
 # === Initialization ===
 set -eo pipefail
 exec > >(tee -a "$LOG_FILE") 2>&1
+
+ERROR_COUNT=0
 
 # === Pre-Flight Checks ===
 check_root() {
@@ -38,13 +39,15 @@ check_root() {
 }
 
 check_system() {
-    local total_mem=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    local total_mem
+    total_mem=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     if [ "$total_mem" -lt 1000000 ]; then
         log_error "Insufficient RAM (Minimum: 1GB)"
         exit 1
     fi
 
-    local free_disk=$(df --output=avail / | tail -1)
+    local free_disk
+    free_disk=$(df --output=avail / | tail -1)
     if [ "$free_disk" -lt 5000000 ]; then
         log_error "Insufficient disk space (Minimum: 5GB free)"
         exit 1
@@ -65,21 +68,6 @@ log() {
 log_error() {
     log "ERROR: $1"
     ((ERROR_COUNT++))
-}
-
-backup_configs() {
-    log "Creating backup in $BACKUP_DIR"
-    mkdir -p "$BACKUP_DIR" || { log_error "Failed to create backup dir"; return 1; }
-    local configs=( "/etc/nginx" "/etc/php" "/etc/mysql" "/etc/redis" )
-    for config in "${configs[@]}"; do
-        if [ -d "$config" ]; then
-            cp -a "$config" "$BACKUP_DIR"
-        fi
-    done
-    # Verifying backup
-    if [ ! -d "$BACKUP_DIR/etc" ]; then
-        log_error "Backup may have failed"
-    fi
 }
 
 install_package() {
@@ -103,7 +91,7 @@ secure_mysql() {
         "DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';"
         "FLUSH PRIVILEGES;"
     )
-    
+
     for cmd in "${sql_commands[@]}"; do
         mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "$cmd" || {
             log_error "MySQL secure command failed: $cmd"
@@ -113,9 +101,16 @@ secure_mysql() {
 }
 
 configure_php() {
+    if [ "$INSTALL_PHP" -ne 1 ]; then return; fi
+
     local php_ini="/etc/php/$PHP_VERSION/fpm/php.ini"
     log "Hardening PHP configuration"
-    
+
+    if [ ! -f "$php_ini" ]; then
+        log_error "$php_ini not found"
+        return 1
+    fi
+
     declare -A php_settings=(
         ["expose_php"]="Off"
         ["disable_functions"]="exec,passthru,shell_exec,system,proc_open,popen"
@@ -125,30 +120,41 @@ configure_php() {
         ["session.cookie_httponly"]="1"
         ["session.cookie_secure"]="1"
     )
-    
+
     for key in "${!php_settings[@]}"; do
-        sed -i "s/^;*$key =.*/$key = ${php_settings[$key]}/" "$php_ini"
+        if grep -q "^$key\s*=" "$php_ini"; then
+            log "$key already set, skipping"
+        else
+            echo "$key = ${php_settings[$key]}" >> "$php_ini"
+            log "Set $key = ${php_settings[$key]}"
+        fi
     done
-    
+
     systemctl restart "php$PHP_VERSION-fpm"
 }
 
 configure_nginx() {
-    # Ensure the directory exists before configuring
+    if [ "$INSTALL_NGINX" -ne 1 ]; then return; fi
+
     if [ ! -d "/etc/nginx/conf.d" ]; then
         mkdir -p /etc/nginx/conf.d
     fi
 
-    log "Configuring Nginx with security headers"
-    cat > /etc/nginx/conf.d/security.conf << 'EOL'
+    local conf_path="/etc/nginx/conf.d/security.conf"
+
+    if [ -f "$conf_path" ]; then
+        log "$conf_path already exists, skipping"
+    else
+        log "Creating security headers config for Nginx"
+        cat > "$conf_path" << 'EOL'
 add_header X-Frame-Options "SAMEORIGIN" always;
 add_header X-XSS-Protection "1; mode=block" always;
 add_header X-Content-Type-Options "nosniff" always;
 add_header Referrer-Policy "no-referrer-when-downgrade" always;
 add_header Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'" always;
 EOL
+    fi
 
-    # Enable TLS if requested
     if [ "$ENABLE_TLS" -eq 1 ]; then
         install_package certbot python3-certbot-nginx
         certbot --nginx -d "$DOMAIN_NAME" --non-interactive --agree-tos --redirect
@@ -156,19 +162,28 @@ EOL
 }
 
 configure_redis() {
-    if [ ! -f /etc/redis/redis.conf ]; then
+    if [ "$INSTALL_REDIS" -ne 1 ]; then return; fi
+
+    local conf="/etc/redis/redis.conf"
+    if [ ! -f "$conf" ]; then
         log_error "Redis config file missing"
         return 1
     fi
-    
+
+    if grep -q "^requirepass" "$conf"; then
+        log "Redis already has a password configured, skipping"
+        return 0
+    fi
+
     log "Securing Redis"
-    local redis_pass=$(openssl rand -hex 32)
+    local redis_pass
+    redis_pass=$(openssl rand -hex 32)
     echo "Redis Password: $redis_pass" >> "$CREDENTIALS_FILE"
-    
-    sed -i 's/^# requirepass .*/requirepass '"$redis_pass"'/' /etc/redis/redis.conf
-    sed -i 's/^supervised no/supervised systemd/' /etc/redis/redis.conf
-    sed -i 's/^bind 127.0.0.1 ::1/bind 127.0.0.1/' /etc/redis/redis.conf
-    
+
+    sed -i 's/^# requirepass .*/requirepass '"$redis_pass"'/' "$conf"
+    sed -i 's/^supervised no/supervised systemd/' "$conf"
+    sed -i 's/^bind 127.0.0.1 ::1/bind 127.0.0.1/' "$conf"
+
     systemctl restart redis-server
 }
 
@@ -187,17 +202,14 @@ check_service_deps() {
 check_root
 setup_logging
 check_system
-backup_configs
 
 log "Starting installation..."
 
-# Validate MYSQL Root Password
 if [ "$INSTALL_MYSQL" -eq 1 ] && [ -z "$MYSQL_ROOT_PASSWORD" ]; then
     log_error "MYSQL_ROOT_PASSWORD cannot be empty"
     exit 1
 fi
 
-# Validate PHP Version
 if [ "$INSTALL_PHP" -eq 1 ]; then
     if ! apt-cache show "php$PHP_VERSION-fpm" &>/dev/null; then
         log_error "PHP $PHP_VERSION is not available"
@@ -205,11 +217,9 @@ if [ "$INSTALL_PHP" -eq 1 ]; then
     fi
 fi
 
-# System Updates
 log "Updating system packages"
 apt-get update -y && apt-get upgrade -y
 
-# Install Components
 check_service_deps
 
 if [ "$INSTALL_NGINX" -eq 1 ]; then
@@ -221,7 +231,7 @@ fi
 if [ "$INSTALL_PHP" -eq 1 ]; then
     add-apt-repository ppa:ondrej/php -y
     apt-get update
-    
+
     PHP_PACKAGES=(
         "php$PHP_VERSION-fpm"
         "php$PHP_VERSION-mysql"
@@ -232,28 +242,28 @@ if [ "$INSTALL_PHP" -eq 1 ]; then
         "php$PHP_VERSION-zip"
         "php$PHP_VERSION-opcache"
     )
-    
+
     for pkg in "${PHP_PACKAGES[@]}"; do
         install_package "$pkg"
     done
-    
+
     configure_php
 fi
 
 if [ "$INSTALL_MYSQL" -eq 1 ]; then
     install_package mysql-server
-    
+
     log "Configuring MySQL password policy"
     mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASSWORD';"
     mysql -e "UNINSTALL PLUGIN validate_password;" 2>/dev/null || true
     mysql -e "INSTALL PLUGIN validate_password SONAME 'validate_password.so';"
-    
+
     case "$MYSQL_PASSWORD_POLICY" in
         LOW)    mysql -e "SET GLOBAL validate_password.policy = 0; SET GLOBAL validate_password.length = 8;";;
         MEDIUM) mysql -e "SET GLOBAL validate_password.policy = 1; SET GLOBAL validate_password.length = 10;";;
         STRONG) mysql -e "SET GLOBAL validate_password.policy = 2; SET GLOBAL validate_password.length = 12;";;
     esac
-    
+
     secure_mysql
 fi
 
@@ -294,7 +304,6 @@ done
 # Completion
 log "Installation completed at $(date)"
 log "Credentials saved to: $CREDENTIALS_FILE"
-log "Backup created in: $BACKUP_DIR"
 log "Next steps:"
 log "1. Review $CREDENTIALS_FILE for sensitive credentials"
 log "2. Set up monitoring (e.g., netdata, prometheus)"
